@@ -1,218 +1,215 @@
-"""Task scheduler using OR-Tools CP-SAT with Prepare -> Wait -> Handle phases."""
+"""CP-SAT solver logic for unified nested Task and Resource scheduling."""
 
-from dataclasses import dataclass, field
-from datetime import date, timedelta
 import math
+from datetime import date, timedelta
+
 from ortools.sat.python import cp_model
 
-
-@dataclass(frozen=True)
-class SubtaskSpec:
-    """A subtask inside a Main Task with Prepare -> Wait -> Handle phases.
-
-    - `prepare_hours`: Active resource hours to prepare/initiate the subtask.
-    - `wait_days`: Minimum passive waiting days (uses 0 resource hours).
-    - `handle_hours`: Active resource hours to handle/complete the subtask after waiting.
-    """
-
-    id: str
-    name: str
-    prepare_hours: int
-    wait_days: int
-    handle_hours: int
+from src.models import (
+    WEEKDAY_NAMES,
+    DailyAssignment,
+    Resource,
+    ScheduledTask,
+    ScheduleResult,
+    Task,
+)
 
 
-@dataclass(frozen=True)
-class Task:
-    """Input definition of a task (either a simple task or a Main Task with subtasks)."""
-
-    id: str
-    name: str
-    hours_needed: int = 0
-    predecessors: list[str] = field(default_factory=list)
-    subtasks: list[SubtaskSpec] = field(default_factory=list)
-    resource: str = "Resource 1"
-
-
-@dataclass(frozen=True)
-class ScheduledPhase:
-    """Solved schedule bar for a single phase (Task, Main Task, Prepare, Wait, or Handle)."""
-
-    task_id: str
-    row_name: str
-    phase: str  # "Main Task", "Task", "Prepare", "Wait", "Handle"
-    hours_needed: int
-    duration_days: int
-    start_day: int
-    end_day: int
-    start_date: date
-    end_date: date
-    resource: str
-
-
-@dataclass(frozen=True)
-class ScheduleResult:
-    """Output returned by the CP-SAT solver."""
-
-    status: str
-    makespan_days: int | None
-    total_hours: int
-    project_start_date: date
-    project_end_date: date | None
-    phases: list[ScheduledPhase]
-
-
-def hours_to_days(hours: int, hours_per_day: int) -> int:
-    """Convert resource work hours into whole working days."""
+def hours_to_work_days(hours: int, hours_per_day: int) -> int:
+    """Convert resource work hours into whole working days for a specific resource."""
     if hours <= 0:
         return 0
     return math.ceil(hours / hours_per_day)
 
 
+def compute_allowed_spans(
+    start_anchor: date,
+    horizon: int,
+    work_days_needed: int,
+    working_weekdays: set[int],
+) -> list[tuple[int, int, int]]:
+    """Precompute valid `(start_day, calendar_span, end_day)` tuples for a resource.
+
+    A task requiring `work_days_needed` working days must start on a working day of
+    the resource and pauses over off-days (e.g., Fri-Sun for a Mon-Thu resource)
+    until `work_days_needed` working days have been completed.
+    """
+    if work_days_needed <= 0:
+        return [(d, 0, d) for d in range(horizon + 1)]
+
+    allowed: list[tuple[int, int, int]] = []
+    for s in range(horizon):
+        s_date = start_anchor + timedelta(days=s)
+        if s_date.weekday() not in working_weekdays:
+            continue
+
+        remaining = work_days_needed
+        cur = s
+        while remaining > 0 and cur < horizon * 2:
+            cur_date = start_anchor + timedelta(days=cur)
+            if cur_date.weekday() in working_weekdays:
+                remaining -= 1
+            cur += 1
+
+        if remaining == 0 and cur <= horizon:
+            end_day = cur
+            span = end_day - s
+            allowed.append((s, span, end_day))
+
+    return allowed
+
+
 def solve_schedule(
     tasks: list[Task],
+    resources: list[Resource],
     project_start_date: date | None = None,
-    hours_per_day: int = 8,
     time_limit_seconds: float = 5.0,
 ) -> ScheduleResult:
-    """Solve a schedule where a single resource executes tasks and parallel subtasks (Prepare -> Wait -> Handle).
-
-    - Active phases (`Task`, `Prepare`, `Handle`) require the resource and cannot overlap (`add_no_overlap`).
-    - Passive `Wait` phases require 0 resource hours and can run in parallel with any active work.
-    - Within each subtask: `Prepare` -> `Wait` (at least `wait_days`) -> `Handle` are contiguous.
-    - A Main Task starts when its earliest subtask starts and ends when all its subtasks finish.
-    """
+    """Solve a schedule for main tasks (with or without nested subtasks) and skilled resources."""
     start_anchor = project_start_date or date.today()
     model = cp_model.CpModel()
 
-    # Calculate a safe upper bound (horizon) in days
-    horizon = 0
-    total_hours = 0
+    # Flatten all leaf tasks (top-level tasks without subtasks + nested subtasks) to compute horizon
+    all_leaf_tasks: list[Task] = []
     for task in tasks:
         if task.subtasks:
-            for sub in task.subtasks:
-                horizon += (
-                    hours_to_days(sub.prepare_hours, hours_per_day)
-                    + sub.wait_days
-                    + hours_to_days(sub.handle_hours, hours_per_day)
-                )
-                total_hours += sub.prepare_hours + sub.handle_hours
+            all_leaf_tasks.extend(task.subtasks)
         else:
-            horizon += hours_to_days(task.hours_needed, hours_per_day)
-            total_hours += task.hours_needed
+            all_leaf_tasks.append(task)
 
-    horizon = max(horizon, 1)
-
-    task_starts: dict[str, cp_model.IntVar] = {}
-    task_ends: dict[str, cp_model.IntVar] = {}
-    task_durations: dict[str, cp_model.IntVar | int] = {}
-
-    # Active resource intervals (cannot overlap because one resource executes the schedule)
-    active_resource_intervals: list[cp_model.IntervalVar] = []
-
-    # Keep references to subtask phase variables so we can extract solved values
-    subtask_vars: dict[str, dict[str, cp_model.IntVar | int]] = {}
-
-    for task in tasks:
-        t_start = model.new_int_var(0, horizon, f"start_{task.id}")
-        t_end = model.new_int_var(0, horizon, f"end_{task.id}")
-        task_starts[task.id] = t_start
-        task_ends[task.id] = t_end
-
-        if not task.subtasks:
-            # Simple sequential task
-            dur_days = hours_to_days(task.hours_needed, hours_per_day)
-            interval = model.new_interval_var(
-                t_start, dur_days, t_end, f"interval_{task.id}"
-            )
-            task_durations[task.id] = dur_days
-            if dur_days > 0:
-                active_resource_intervals.append(interval)
-        else:
-            # Main Task with parallel subtasks (each split into Prepare -> Wait -> Handle)
-            t_dur = model.new_int_var(0, horizon, f"dur_{task.id}")
-            model.new_interval_var(t_start, t_dur, t_end, f"interval_{task.id}")
-            task_durations[task.id] = t_dur
-
-            sub_starts: list[cp_model.IntVar] = []
-            sub_ends: list[cp_model.IntVar] = []
-
-            for sub in task.subtasks:
-                prep_days = hours_to_days(sub.prepare_hours, hours_per_day)
-                handle_days = hours_to_days(sub.handle_hours, hours_per_day)
-
-                # Phase 1: Prepare (active resource work)
-                p_start = model.new_int_var(0, horizon, f"prep_start_{sub.id}")
-                p_end = model.new_int_var(0, horizon, f"prep_end_{sub.id}")
-                p_interval = model.new_interval_var(
-                    p_start, prep_days, p_end, f"prep_interval_{sub.id}"
-                )
-                if prep_days > 0:
-                    active_resource_intervals.append(p_interval)
-
-                # Phase 2: Wait (passive lead time, 0 resource needed, at least sub.wait_days)
-                # Starts immediately when Prepare finishes; can stretch if resource is busy when wait ends
-                w_start = p_end
-                w_dur = model.new_int_var(sub.wait_days, horizon, f"wait_dur_{sub.id}")
-                w_end = model.new_int_var(0, horizon, f"wait_end_{sub.id}")
-                model.new_interval_var(
-                    w_start, w_dur, w_end, f"wait_interval_{sub.id}"
-                )
-
-                # Phase 3: Handle (active resource work, starts when Wait ends)
-                h_start = w_end
-                h_end = model.new_int_var(0, horizon, f"handle_end_{sub.id}")
-                h_interval = model.new_interval_var(
-                    h_start, handle_days, h_end, f"handle_interval_{sub.id}"
-                )
-                if handle_days > 0:
-                    active_resource_intervals.append(h_interval)
-
-                sub_starts.append(p_start)
-                sub_ends.append(h_end)
-
-                subtask_vars[sub.id] = {
-                    "p_start": p_start,
-                    "p_end": p_end,
-                    "p_days": prep_days,
-                    "w_start": w_start,
-                    "w_end": w_end,
-                    "w_dur": w_dur,
-                    "h_start": h_start,
-                    "h_end": h_end,
-                    "h_days": handle_days,
-                }
-
-            # Main Task starts when the first subtask starts and ends when all subtasks finish
-            model.add_min_equality(t_start, sub_starts)
-            model.add_max_equality(t_end, sub_ends)
-
-    # Precedence constraints between tasks / main tasks
-    for task in tasks:
-        for pred_id in task.predecessors:
-            model.add(task_starts[task.id] >= task_ends[pred_id])
-
-    # Single Resource Constraint: active work phases (Task, Prepare, Handle) cannot overlap!
-    # Passive Wait phases are NOT in this list, so the resource works on other subtasks while waiting.
-    if active_resource_intervals:
-        model.add_no_overlap(active_resource_intervals)
-
-    # Objective: Minimize total project makespan, finish tasks as early as possible,
-    # and start subtask Prepare/Handle phases as early as possible.
-    makespan = model.new_int_var(0, horizon, "makespan")
-    model.add_max_equality(makespan, list(task_ends.values()))
-    sub_phase_vars = [
-        sv["p_start"] for sv in subtask_vars.values()
-    ] + [
-        sv["h_end"] for sv in subtask_vars.values()
-    ]
-    model.minimize(
-        makespan * 1000
-        + sum(task_ends.values()) * 10
-        + sum(sub_phase_vars)
+    min_hpd = min((r.hours_per_day for r in resources), default=8)
+    total_hours = sum(t.hours_needed for t in all_leaf_tasks)
+    raw_work_days = sum(
+        hours_to_work_days(t.hours_needed, min_hpd) + t.wait_days
+        for t in all_leaf_tasks
     )
 
-    # Solve
+    # Multiply by 2.5 + 14 days buffer to account for 3-4 day working weeks & off-days
+    horizon = max(int(raw_work_days * 2.5) + 14, 14)
+
+    # Index resources by skill
+    resources_by_skill: dict[str, list[Resource]] = {}
+    for res in resources:
+        for skill in res.skills:
+            resources_by_skill.setdefault(skill, []).append(res)
+
+    # Cache allowed `(start, span, end)` tables per `(resource_id, work_days_needed)`
+    span_table_cache: dict[tuple[str, int], list[tuple[int, int, int]]] = {}
+
+    def get_span_table(res: Resource, work_days_needed: int) -> list[tuple[int, int, int]]:
+        key = (res.id, work_days_needed)
+        if key not in span_table_cache:
+            span_table_cache[key] = compute_allowed_spans(
+                start_anchor=start_anchor,
+                horizon=horizon,
+                work_days_needed=work_days_needed,
+                working_weekdays=set(res.working_days),
+            )
+        return span_table_cache[key]
+
+    # Active optional intervals per resource for NoOverlap
+    resource_intervals: dict[str, list[cp_model.IntervalVar]] = {
+        res.id: [] for res in resources
+    }
+
+    starts: dict[str, cp_model.IntVar] = {}
+    ends: dict[str, cp_model.IntVar] = {}
+    spans: dict[str, cp_model.IntVar | int] = {}
+    assign_vars_by_task: dict[str, dict[str, cp_model.IntVar]] = {}
+
+    def add_leaf_task(leaf: Task) -> None:
+        """Create variables and resource assignment constraints for any leaf task or subtask."""
+        t_start = model.new_int_var(0, horizon, f"start_{leaf.id}")
+        t_end = model.new_int_var(0, horizon, f"end_{leaf.id}")
+        starts[leaf.id] = t_start
+        ends[leaf.id] = t_end
+
+        if leaf.hours_needed <= 0 or leaf.required_skill is None:
+            # Passive waiting task (0 resource hours needed)
+            w_days = leaf.wait_days
+            model.new_interval_var(t_start, w_days, t_end, f"wait_iv_{leaf.id}")
+            spans[leaf.id] = w_days
+            assign_vars_by_task[leaf.id] = {}
+            return
+
+        eligible = resources_by_skill.get(leaf.required_skill, [])
+        if not eligible:
+            raise ValueError(
+                f"No resource found with required skill '{leaf.required_skill}' for task '{leaf.id}'"
+            )
+
+        t_span = model.new_int_var(0, horizon, f"span_{leaf.id}")
+        spans[leaf.id] = t_span
+
+        assign_vars = {
+            res.id: model.new_bool_var(f"assign_{leaf.id}_{res.id}")
+            for res in eligible
+        }
+        model.add_exactly_one(list(assign_vars.values()))
+        assign_vars_by_task[leaf.id] = assign_vars
+
+        for res in eligible:
+            is_assigned = assign_vars[res.id]
+            w_days = hours_to_work_days(leaf.hours_needed, res.hours_per_day)
+            allowed_tuples = get_span_table(res, w_days)
+
+            r_start = model.new_int_var(0, horizon, f"r_start_{leaf.id}_{res.id}")
+            r_span = model.new_int_var(0, horizon, f"r_span_{leaf.id}_{res.id}")
+            r_end = model.new_int_var(0, horizon, f"r_end_{leaf.id}_{res.id}")
+            model.add_allowed_assignments([r_start, r_span, r_end], allowed_tuples)
+
+            model.add(t_start == r_start).only_enforce_if(is_assigned)
+            model.add(t_span == r_span).only_enforce_if(is_assigned)
+            model.add(t_end == r_end).only_enforce_if(is_assigned)
+
+            opt_interval = model.new_optional_interval_var(
+                r_start, r_span, r_end, is_assigned, f"opt_iv_{leaf.id}_{res.id}"
+            )
+            resource_intervals[res.id].append(opt_interval)
+
+    # 1. Create variables for all main tasks and their nested subtasks
+    for task in tasks:
+        if not task.subtasks:
+            add_leaf_task(task)
+        else:
+            t_start = model.new_int_var(0, horizon, f"start_{task.id}")
+            t_end = model.new_int_var(0, horizon, f"end_{task.id}")
+            t_span = model.new_int_var(0, horizon, f"span_{task.id}")
+            model.new_interval_var(t_start, t_span, t_end, f"interval_{task.id}")
+            starts[task.id] = t_start
+            ends[task.id] = t_end
+            spans[task.id] = t_span
+
+            for sub in task.subtasks:
+                add_leaf_task(sub)
+
+            # Main Task starts when its earliest subtask starts and ends when all subtasks finish
+            model.add_min_equality(t_start, [starts[sub.id] for sub in task.subtasks])
+            model.add_max_equality(t_end, [ends[sub.id] for sub in task.subtasks])
+
+    # 2. Precedence constraints (both top-level tasks and nested subtasks)
+    for task in tasks:
+        for pred_id in task.predecessors:
+            model.add(starts[task.id] >= ends[pred_id])
+        for sub in task.subtasks:
+            for pred_id in sub.predecessors:
+                model.add(starts[sub.id] >= ends[pred_id])
+
+    # 3. Per-Resource NoOverlap constraint
+    for intervals in resource_intervals.values():
+        if intervals:
+            model.add_no_overlap(intervals)
+
+    # 4. Objective: Minimize total project makespan and finish all tasks/subtasks as early as possible
+    makespan = model.new_int_var(0, horizon, "makespan")
+    model.add_max_equality(makespan, [ends[t.id] for t in tasks])
+    model.minimize(
+        makespan * 1000
+        + sum(ends[t.id] for t in tasks) * 10
+        + sum(ends[leaf.id] for leaf in all_leaf_tasks)
+    )
+
+    # 5. Solve
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit_seconds
     status_code = solver.solve(model)
@@ -225,102 +222,129 @@ def solve_schedule(
             total_hours=total_hours,
             project_start_date=start_anchor,
             project_end_date=None,
-            phases=[],
+            tasks=[],
+        )
+
+    resource_by_id = {res.id: res for res in resources}
+
+    def get_assigned_resource(task_id: str) -> Resource | None:
+        for res_id, var in assign_vars_by_task.get(task_id, {}).items():
+            if solver.boolean_value(var):
+                return resource_by_id[res_id]
+        return None
+
+    def build_scheduled_leaf(leaf: Task, parent_id: str | None) -> ScheduledTask:
+        s_day = solver.value(starts[leaf.id])
+        e_day = solver.value(ends[leaf.id])
+        c_days = solver.value(spans[leaf.id])
+        res = get_assigned_resource(leaf.id)
+
+        if res is None:
+            return ScheduledTask(
+                id=leaf.id,
+                name=leaf.name,
+                parent_id=parent_id,
+                task_type="Wait Subtask" if parent_id else "Main Task (Simple)",
+                required_skill="—",
+                assigned_resource="— (Wait)",
+                hours_needed=0,
+                work_days=0,
+                calendar_days=c_days,
+                start_day=s_day,
+                end_day=e_day,
+                start_date=start_anchor + timedelta(days=s_day),
+                end_date=start_anchor + timedelta(days=e_day),
+            )
+
+        return ScheduledTask(
+            id=leaf.id,
+            name=leaf.name,
+            parent_id=parent_id,
+            task_type="Subtask" if parent_id else "Main Task (Simple)",
+            required_skill=leaf.required_skill or "—",
+            assigned_resource=res.name,
+            hours_needed=leaf.hours_needed,
+            work_days=hours_to_work_days(leaf.hours_needed, res.hours_per_day),
+            calendar_days=c_days,
+            start_day=s_day,
+            end_day=e_day,
+            start_date=start_anchor + timedelta(days=s_day),
+            end_date=start_anchor + timedelta(days=e_day),
         )
 
     solved_makespan = solver.value(makespan)
-    phases: list[ScheduledPhase] = []
+    scheduled_tasks: list[ScheduledTask] = []
+    daily_assignments: list[DailyAssignment] = []
+
+    def record_daily_hours(leaf: Task, s_day: int, e_day: int, res: Resource | None) -> None:
+        if res is None or leaf.hours_needed <= 0:
+            return
+        remaining = leaf.hours_needed
+        working_set = set(res.working_days)
+        for day_offset in range(s_day, e_day):
+            if remaining <= 0:
+                break
+            cal_date = start_anchor + timedelta(days=day_offset)
+            if cal_date.weekday() in working_set:
+                hours_today = min(remaining, res.hours_per_day)
+                remaining -= hours_today
+                daily_assignments.append(
+                    DailyAssignment(
+                        date=cal_date,
+                        weekday=WEEKDAY_NAMES[cal_date.weekday()],
+                        resource_id=res.id,
+                        resource_name=res.name,
+                        task_id=leaf.id,
+                        task_name=leaf.name.strip(),
+                        skill=leaf.required_skill or "—",
+                        hours=hours_today,
+                    )
+                )
 
     for task in tasks:
-        t_s = solver.value(task_starts[task.id])
-        t_e = solver.value(task_ends[task.id])
-        t_d = solver.value(task_durations[task.id])
-
         if not task.subtasks:
-            phases.append(
-                ScheduledPhase(
-                    task_id=task.id,
-                    row_name=task.name,
-                    phase="Task",
-                    hours_needed=task.hours_needed,
-                    duration_days=t_d,
-                    start_day=t_s,
-                    end_day=t_e,
-                    start_date=start_anchor + timedelta(days=t_s),
-                    end_date=start_anchor + timedelta(days=t_e),
-                    resource=task.resource,
-                )
-            )
+            st = build_scheduled_leaf(task, parent_id=None)
+            scheduled_tasks.append(st)
+            record_daily_hours(task, st.start_day, st.end_day, get_assigned_resource(task.id))
         else:
-            main_hours = sum(
-                sub.prepare_hours + sub.handle_hours for sub in task.subtasks
+            t_s = solver.value(starts[task.id])
+            t_e = solver.value(ends[task.id])
+            t_d = solver.value(spans[task.id])
+            sub_results = [
+                build_scheduled_leaf(sub, parent_id=task.id) for sub in task.subtasks
+            ]
+            for sub, st in zip(task.subtasks, sub_results):
+                record_daily_hours(sub, st.start_day, st.end_day, get_assigned_resource(sub.id))
+            sub_skills = sorted(
+                {s.required_skill for s in sub_results if s.required_skill != "—"}
             )
-            phases.append(
-                ScheduledPhase(
-                    task_id=task.id,
-                    row_name=task.name,
-                    phase="Main Task",
-                    hours_needed=main_hours,
-                    duration_days=t_d,
+            sub_resources = sorted(
+                {
+                    s.assigned_resource
+                    for s in sub_results
+                    if not s.assigned_resource.startswith("—")
+                }
+            )
+            scheduled_tasks.append(
+                ScheduledTask(
+                    id=task.id,
+                    name=task.name,
+                    parent_id=None,
+                    task_type="Main Task (with Subtasks)",
+                    required_skill=", ".join(sub_skills),
+                    assigned_resource=", ".join(sub_resources),
+                    hours_needed=sum(s.hours_needed for s in sub_results),
+                    work_days=sum(s.work_days for s in sub_results),
+                    calendar_days=t_d,
                     start_day=t_s,
                     end_day=t_e,
                     start_date=start_anchor + timedelta(days=t_s),
                     end_date=start_anchor + timedelta(days=t_e),
-                    resource=task.resource,
                 )
             )
-            for sub in task.subtasks:
-                sv = subtask_vars[sub.id]
-                p_s = solver.value(sv["p_start"])
-                p_e = solver.value(sv["p_end"])
-                w_s = solver.value(sv["w_start"])
-                w_e = solver.value(sv["w_end"])
-                w_d = solver.value(sv["w_dur"])
-                h_s = solver.value(sv["h_start"])
-                h_e = solver.value(sv["h_end"])
+            scheduled_tasks.extend(sub_results)
 
-                phases.append(
-                    ScheduledPhase(
-                        task_id=sub.id,
-                        row_name=sub.name,
-                        phase="Prepare",
-                        hours_needed=sub.prepare_hours,
-                        duration_days=int(sv["p_days"]),
-                        start_day=p_s,
-                        end_day=p_e,
-                        start_date=start_anchor + timedelta(days=p_s),
-                        end_date=start_anchor + timedelta(days=p_e),
-                        resource=task.resource,
-                    )
-                )
-                phases.append(
-                    ScheduledPhase(
-                        task_id=sub.id,
-                        row_name=sub.name,
-                        phase="Wait",
-                        hours_needed=0,
-                        duration_days=w_d,
-                        start_day=w_s,
-                        end_day=w_e,
-                        start_date=start_anchor + timedelta(days=w_s),
-                        end_date=start_anchor + timedelta(days=w_e),
-                        resource=task.resource,
-                    )
-                )
-                phases.append(
-                    ScheduledPhase(
-                        task_id=sub.id,
-                        row_name=sub.name,
-                        phase="Handle",
-                        hours_needed=sub.handle_hours,
-                        duration_days=int(sv["h_days"]),
-                        start_day=h_s,
-                        end_day=h_e,
-                        start_date=start_anchor + timedelta(days=h_s),
-                        end_date=start_anchor + timedelta(days=h_e),
-                        resource=task.resource,
-                    )
-                )
+    daily_assignments.sort(key=lambda a: (a.date, a.resource_id, a.task_id))
 
     return ScheduleResult(
         status=status_name,
@@ -328,98 +352,6 @@ def solve_schedule(
         total_hours=total_hours,
         project_start_date=start_anchor,
         project_end_date=start_anchor + timedelta(days=solved_makespan),
-        phases=phases,
+        tasks=scheduled_tasks,
+        daily_assignments=daily_assignments,
     )
-
-
-def build_sample_tasks(resource: str = "Resource 1") -> list[Task]:
-    """Create a realistic schedule with 6 simple tasks and 4 Main Tasks (13 parallel subtasks)."""
-    return [
-        Task(
-            id="T1",
-            name="T1: Project Kickoff",
-            hours_needed=16,
-            resource=resource,
-        ),
-        Task(
-            id="T2",
-            name="T2: Requirements & Architecture",
-            hours_needed=24,
-            predecessors=["T1"],
-            resource=resource,
-        ),
-        Task(
-            id="M1",
-            name="M1: Procurement & Vendor Setup (Main)",
-            predecessors=["T2"],
-            resource=resource,
-            subtasks=[
-                SubtaskSpec(id="M1.1", name="  ↳ M1.1: Cloud Infrastructure", prepare_hours=8, wait_days=4, handle_hours=16),
-                SubtaskSpec(id="M1.2", name="  ↳ M1.2: Security Certificates", prepare_hours=8, wait_days=6, handle_hours=8),
-                SubtaskSpec(id="M1.3", name="  ↳ M1.3: Third-Party API Keys", prepare_hours=8, wait_days=3, handle_hours=8),
-            ],
-        ),
-        Task(
-            id="T3",
-            name="T3: Core Data Model",
-            hours_needed=16,
-            predecessors=["M1"],
-            resource=resource,
-        ),
-        Task(
-            id="M2",
-            name="M2: Core Module Development (Main)",
-            predecessors=["T3"],
-            resource=resource,
-            subtasks=[
-                SubtaskSpec(id="M2.1", name="  ↳ M2.1: Auth & Permissions", prepare_hours=16, wait_days=3, handle_hours=16),
-                SubtaskSpec(id="M2.2", name="  ↳ M2.2: Billing Integration", prepare_hours=8, wait_days=5, handle_hours=16),
-                SubtaskSpec(id="M2.3", name="  ↳ M2.3: Notification Service", prepare_hours=8, wait_days=2, handle_hours=8),
-                SubtaskSpec(id="M2.4", name="  ↳ M2.4: Audit Logging", prepare_hours=8, wait_days=3, handle_hours=8),
-            ],
-        ),
-        Task(
-            id="T4",
-            name="T4: System Integration",
-            hours_needed=16,
-            predecessors=["M2"],
-            resource=resource,
-        ),
-        Task(
-            id="M3",
-            name="M3: External Testing & Audits (Main)",
-            predecessors=["T4"],
-            resource=resource,
-            subtasks=[
-                SubtaskSpec(id="M3.1", name="  ↳ M3.1: Penetration Test", prepare_hours=8, wait_days=5, handle_hours=16),
-                SubtaskSpec(id="M3.2", name="  ↳ M3.2: Performance Load Test", prepare_hours=16, wait_days=3, handle_hours=8),
-                SubtaskSpec(id="M3.3", name="  ↳ M3.3: Accessibility Review", prepare_hours=8, wait_days=4, handle_hours=8),
-            ],
-        ),
-        Task(
-            id="T5",
-            name="T5: Release Candidate Sign-off",
-            hours_needed=8,
-            predecessors=["M3"],
-            resource=resource,
-        ),
-        Task(
-            id="M4",
-            name="M4: Rollout & Store Approvals (Main)",
-            predecessors=["T5"],
-            resource=resource,
-            subtasks=[
-                SubtaskSpec(id="M4.1", name="  ↳ M4.1: App Store Review", prepare_hours=8, wait_days=4, handle_hours=8),
-                SubtaskSpec(id="M4.2", name="  ↳ M4.2: Customer Migration", prepare_hours=16, wait_days=3, handle_hours=16),
-                SubtaskSpec(id="M4.3", name="  ↳ M4.3: Partner Onboarding", prepare_hours=8, wait_days=5, handle_hours=8),
-            ],
-        ),
-        Task(
-            id="T6",
-            name="T6: Handover & Project Closure",
-            hours_needed=16,
-            predecessors=["M4"],
-            resource=resource,
-        ),
-    ]
-
