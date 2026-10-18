@@ -18,7 +18,10 @@
 6. **Zero Warnings Allowed**: Linter, type-checker, and Marimo warnings are strictly not allowed and must always be fixed before finishing any step:
    - After creating or editing any Python file, always run `uvx ruff check --fix src/ notebook.py` and `uv run marimo check notebook.py` (and resolve any remaining diagnostics) so that zero warnings or errors remain across the codebase.
    - In Marimo cells that do not export variables, omit trailing bare `return` statements (`PLR1711`).
-7. **Keep Solver Documentation Updated**: Whenever any changes are made to the schedule solver functionality (such as variables, constraints, objective function, horizon calculation, or post-processing in `src/scheduler.py`), always update `SOLVE_SCHEDULE.md` so the documentation accurately reflects how the solver works.
+7. **Keep Solver Documentation Updated & Junior-Friendly (`docs/`)**:
+   - Store project documentation in the `docs/` directory.
+   - Write all documentation so that a **junior developer** (with no prior CP-SAT or constraint-programming experience) can clearly understand how CP-SAT is used and configured to create the best schedule—using plain-English explanations, diagrams, and concrete numeric examples.
+   - Whenever any changes are made to the schedule solver functionality (such as variables, constraints, objective function, horizon calculation, or post-processing in `src/scheduler.py`), always update `docs/SOLVE_SCHEDULE.md` so it stays accurate and accessible to juniors.
 
 ## Project Scope & Stack
 
@@ -35,7 +38,7 @@
   - Use clear, typed data structures (e.g., `dataclass`) for inputs (tasks, resources, horizon) and outputs (solve status, scheduled intervals, makespan).
   - Always check and report the solver status (`OPTIMAL`, `FEASIBLE`, `INFEASIBLE`, `MODEL_INVALID`) rather than assuming a solution exists.
   - Set a sensible solver time limit (`solver.parameters.max_time_in_seconds`).
-  - Keep `SOLVE_SCHEDULE.md` synchronized with any changes to `solve_schedule` or its helper functions.
+  - Keep `docs/SOLVE_SCHEDULE.md` synchronized with any changes to `solve_schedule` or its helper functions, maintaining its junior-friendly explanations and examples.
 - **Visualizations & Tables (`src/`)**:
   - Create a separate, dedicated function for every chart and every table in a dedicated module rather than building DataFrames or Altair charts inline in the notebook.
 - **Marimo Notebooks**:
