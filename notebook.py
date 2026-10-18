@@ -56,6 +56,7 @@ def _(mo):
     - **Subtasks**: Subtasks inside a Main Task can run **in parallel** or have dependencies (`predecessors`) among themselves (including passive waiting subtasks with `hours_needed=0, wait_days>0`).
     - **Skills (`skill1`, `skill2`, `skill3`) & Availability**: CP-SAT assigns an eligible resource to each active task/subtask and pauses multi-day tasks over the resource's off-days.
     """)
+    return
 
 
 @app.cell
@@ -154,6 +155,7 @@ def _(
             mo.ui.table(scheduled_tasks_df),
         ]
     )
+    return
 
 
 if __name__ == "__main__":
