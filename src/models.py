@@ -1,4 +1,4 @@
-"""Domain models and sample task data for scheduling."""
+"""Domain models for projects, tasks, resources, and solved schedules."""
 
 from __future__ import annotations
 
@@ -10,9 +10,11 @@ WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 @dataclass(frozen=True)
 class Resource:
-    """A resource with skills and weekly availability.
+    """A resource with skills, home postal code (Dutch), and weekly availability.
 
     - `skills`: e.g. `["skill1"]`, `["skill2", "skill3"]`
+    - `postal_code`: Dutch postal code (`"NNNN AA"`), e.g. `"3511 JC"`
+    - `city`: Dutch city name for display
     - `working_days`: weekdays `0..6` where `0=Mon, 1=Tue, ..., 6=Sun`
         (e.g. `[0, 1, 2, 3]` for Monday to Thursday)
     - `hours_per_day`: active working hours per working day (e.g. 8)
@@ -21,6 +23,8 @@ class Resource:
     id: str
     name: str
     skills: list[str]
+    postal_code: str = "3511 JC"
+    city: str = "Utrecht"
     working_days: list[int] = field(default_factory=lambda: [0, 1, 2, 3])
     hours_per_day: int = 8
 
@@ -50,15 +54,51 @@ class Task:
 
 
 @dataclass(frozen=True)
-class ScheduledTask:
-    """Solved schedule bar for a single task, main task, or subtask."""
+class Project:
+    """A project executed at a Dutch postal code address with its own task schedule."""
 
+    id: str
+    name: str
+    postal_code: str
+    city: str
+    start_date: date
+    tasks: list[Task] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ProjectSummary:
+    """Solved summary details for a single `Project`."""
+
+    project_id: str
+    project_name: str
+    city: str
+    postal_code: str
+    status: str
+    start_date: date
+    end_date: date | None
+    makespan_days: int | None
+    main_task_count: int
+    leaf_task_count: int
+    total_hours: int
+    total_distance_km: float
+    assigned_resources: str
+
+
+@dataclass(frozen=True)
+class ScheduledTask:
+    """Solved schedule bar for a single task, main task, or subtask within a project."""
+
+    project_id: str
+    project_name: str
+    project_postal_code: str
     id: str
     name: str
     parent_id: str | None
     task_type: str  # "Main Task (with Subtasks)", "Main Task (Simple)", "Subtask", "Wait Subtask"
     required_skill: str
     assigned_resource: str
+    resource_postal_code: str
+    distance_km: float | None
     hours_needed: int
     work_days: int
     calendar_days: int
@@ -70,12 +110,17 @@ class ScheduledTask:
 
 @dataclass(frozen=True)
 class DailyAssignment:
-    """Hours assigned to a resource on a single calendar date."""
+    """Hours assigned to a resource on a single calendar date for a project task."""
 
     date: date
     weekday: str
+    project_id: str
+    project_name: str
+    project_postal_code: str
     resource_id: str
     resource_name: str
+    resource_postal_code: str
+    distance_km: float
     task_id: str
     task_name: str
     skill: str
@@ -84,12 +129,14 @@ class DailyAssignment:
 
 @dataclass(frozen=True)
 class ScheduleResult:
-    """Output returned by the CP-SAT solver."""
+    """Output returned by the CP-SAT solver for one or more `Project` schedules."""
 
     status: str
     makespan_days: int | None
     total_hours: int
-    project_start_date: date
-    project_end_date: date | None
+    total_distance_km: float
+    schedule_start_date: date
+    schedule_end_date: date | None
+    projects: list[ProjectSummary]
     tasks: list[ScheduledTask]
     daily_assignments: list[DailyAssignment] = field(default_factory=list)
